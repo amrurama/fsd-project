@@ -1,45 +1,70 @@
-# Smart Task Orchestrator Backend (Unified Server)
+# Project Tracker Backend
 
-## Run locally
+The unified Express API runs on `http://localhost:4000`.
+
 ```bash
-cd src/backend
 npm install
 npm start
 ```
-The unified API runs on `http://localhost:4000`.
 
-## Key Endpoints
+## Core Endpoints
 
-### Auth
+Auth and users:
+
 - `POST /auth/signup`
 - `POST /auth/login`
+- `GET /users/me`
+- `GET /users?search=alice`
 
-### Templates
+Templates:
+
 - `GET /templates`
+- `GET /templates/:templateId/versions`
 - `POST /templates`
 - `POST /templates/:templateId/versions`
 
-### Projects
-- `GET /projects`
-- `POST /projects`
+Projects:
 
-### Trackers & Tasks
+- `GET /projects`
+- `GET /projects/:projectId`
+- `GET /projects/:projectId/members`
+- `POST /projects`
+- `PUT /projects/:projectId`
+- `DELETE /projects/:projectId`
+
+Trackers and tasks:
+
+- `GET /projects/:projectId/trackers`
 - `POST /trackers`
+- `PUT /trackers/:trackerId`
+- `DELETE /trackers/:trackerId`
+- `GET /trackers/:trackerId/tasks`
+- `GET /tasks/report`
 - `POST /tasks`
 - `PUT /tasks/:taskId`
-- `GET /tasks/report`
+- `DELETE /tasks/:taskId`
+- `GET /tasks/:taskId/comments`
+- `POST /tasks/:taskId/comments`
 
-### Notifications
+Notifications and audit:
+
 - `GET /notifications`
 - `POST /notifications`
-
-### Audit Logs
-- `GET /audit?entityType=...&entityId=...`
+- `PUT /notifications/:notificationId/read`
+- `PUT /notifications/read-all`
+- `GET /audit`
+- `GET /audit?entityType=tracker_task&entityId=<task-id>`
 - `POST /audit`
 
-## Migration Note (existing DBs)
-If you already created the database before adding `member_email`, run:
+## Existing Database Migration
+
 ```sql
 ALTER TABLE project_members
 ADD COLUMN IF NOT EXISTS member_email VARCHAR(150);
+```
+
+Then run:
+
+```bash
+psql -U postgres -d smart_tasks -f db/migrations/002_add_access_indexes.sql
 ```
