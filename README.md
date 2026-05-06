@@ -4,7 +4,7 @@ Full-stack project tracker for creating shared project workspaces, adding tracke
 
 ## What Is Included
 
-- User signup/login with JWT auth
+- User signup/login with Basic auth
 - Project creation with email-based sharing
 - Project member lookup and assignable member lists
 - Tracker creation per project, with optional template versions
