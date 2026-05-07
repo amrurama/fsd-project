@@ -1,4 +1,4 @@
-# Project Tracker Backend
+# ProjectPulse Backend
 
 The unified Express API runs on `http://localhost:4000`.
 

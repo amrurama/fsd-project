@@ -1,6 +1,6 @@
-# Project Tracker
+# ProjectPulse
 
-Full-stack project tracker for creating shared project workspaces, adding trackers, assigning tasks, commenting on tasks, receiving notifications, and reviewing audit history.
+Full-stack ProjectPulse for creating shared project workspaces, adding trackers, assigning tasks, commenting on tasks, receiving notifications, and reviewing audit history.
 
 ## What Is Included
 
