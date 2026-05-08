@@ -21,6 +21,7 @@ Admin:
 - `GET /admin/users`
 - `POST /admin/users`
 - `PUT /admin/users/:userId/role`
+- `PUT /admin/users/:userId/password`
 - `POST /admin/users/:userId/roles`
 - `DELETE /admin/users/:userId/roles/:role`
 

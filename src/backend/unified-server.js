@@ -33,6 +33,16 @@ const normalizeEmail = (email) => {
   return trimmed || null;
 };
 
+const normalizeUsername = (username) => String(username || '').trim();
+
+const normalizePassword = (password) => String(password || '');
+
+const hashPassword = (password) => bcrypt.hash(normalizePassword(password), 10);
+
+const verifyPassword = (password, passwordHash) => (
+  passwordHash ? bcrypt.compare(normalizePassword(password), passwordHash) : false
+);
+
 const normalizeStatus = (status) => {
   if (!status) {
     return null;
@@ -567,11 +577,13 @@ const ensureRoleSchema = async () => {
 };
 
 const createUserAccount = async ({ username, password, displayName, email }) => {
+  const normalizedUsername = normalizeUsername(username);
+  const normalizedPassword = normalizePassword(password);
   const normalizedEmail = normalizeEmail(email);
-  if (!username || !password) {
+  if (!normalizedUsername || !normalizedPassword) {
     throw httpError(400, 'username and password required');
   }
-  if (password.length < 6) {
+  if (normalizedPassword.length < 6) {
     throw httpError(400, 'Password must be at least 6 characters');
   }
 
@@ -581,18 +593,18 @@ const createUserAccount = async ({ username, password, displayName, email }) => 
      WHERE lower(username) = lower($1)
         OR ($2::text IS NOT NULL AND lower(email) = lower($2))
      LIMIT 1`,
-    [username.trim(), normalizedEmail]
+    [normalizedUsername, normalizedEmail]
   );
   if (existing.rows.length > 0) {
     throw httpError(409, 'A user with that username or email already exists');
   }
 
-  const hash = await bcrypt.hash(password, 10);
+  const hash = await hashPassword(normalizedPassword);
   const result = await pool.query(
     `INSERT INTO users (username, password_hash, display_name, email)
      VALUES ($1, $2, $3, $4)
      RETURNING id, username, display_name, email, created_at`,
-    [username.trim(), hash, displayName || null, normalizedEmail]
+    [normalizedUsername, hash, displayName ? String(displayName).trim() || null : null, normalizedEmail]
   );
   const user = result.rows[0];
   await ensureDefaultRole(pool, user);
@@ -608,19 +620,29 @@ app.post('/auth/signup', asyncHandler(async (req, res) => {
 }));
 
 app.post('/auth/login', asyncHandler(async (req, res) => {
-  const { username, password } = req.body;
+  const username = normalizeUsername(req.body.username);
+  const password = normalizePassword(req.body.password);
   if (!username || !password) {
     throw httpError(400, 'username and password required');
   }
-  const result = await pool.query(
+  let result = await pool.query(
     'SELECT * FROM users WHERE lower(username) = lower($1) OR lower(email) = lower($1) LIMIT 1',
-    [username.trim()]
+    [username]
   );
+  if (result.rows.length === 0) {
+    const displayNameResult = await pool.query(
+      'SELECT * FROM users WHERE lower(display_name) = lower($1) LIMIT 2',
+      [username]
+    );
+    if (displayNameResult.rows.length === 1) {
+      result = displayNameResult;
+    }
+  }
   if (result.rows.length === 0) {
     throw httpError(401, 'Invalid credentials');
   }
   const user = result.rows[0];
-  const match = await bcrypt.compare(password, user.password_hash);
+  const match = await verifyPassword(password, user.password_hash);
   if (!match) {
     throw httpError(401, 'Invalid credentials');
   }
@@ -737,6 +759,31 @@ app.put('/admin/users/:userId/role', requireAdmin, asyncHandler(async (req, res)
     actor: req.currentUser
   });
   res.json(toPublicUser(updated));
+}));
+
+app.put('/admin/users/:userId/password', requireAdmin, asyncHandler(async (req, res) => {
+  const password = normalizePassword(req.body.password);
+  if (password.length < 6) {
+    throw httpError(400, 'Password must be at least 6 characters');
+  }
+
+  const target = await getUserWithRoles(pool, req.params.userId);
+  if (!target) {
+    throw httpError(404, 'User not found');
+  }
+
+  const hash = await hashPassword(password);
+  await pool.query('UPDATE users SET password_hash = $1 WHERE id = $2', [hash, req.params.userId]);
+  await logAudit(pool, {
+    entityType: 'user',
+    entityId: req.params.userId,
+    userId: req.currentUser.id,
+    action: 'PASSWORD_RESET',
+    note: `${req.currentUser.username} reset the password for ${target.username}`
+  });
+  await notifyUser(pool, req.params.userId, `${req.currentUser.username} reset your password.`);
+
+  res.json(toPublicUser(target));
 }));
 
 app.post('/admin/users/:userId/roles', requireAdmin, asyncHandler(async (req, res) => {
