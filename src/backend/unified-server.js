@@ -566,10 +566,8 @@ const ensureRoleSchema = async () => {
   );
 };
 
-// Auth
-app.post('/auth/signup', asyncHandler(async (req, res) => {
-  const { username, password, displayName } = req.body;
-  const email = normalizeEmail(req.body.email);
+const createUserAccount = async ({ username, password, displayName, email }) => {
+  const normalizedEmail = normalizeEmail(email);
   if (!username || !password) {
     throw httpError(400, 'username and password required');
   }
@@ -583,7 +581,7 @@ app.post('/auth/signup', asyncHandler(async (req, res) => {
      WHERE lower(username) = lower($1)
         OR ($2::text IS NOT NULL AND lower(email) = lower($2))
      LIMIT 1`,
-    [username.trim(), email]
+    [username.trim(), normalizedEmail]
   );
   if (existing.rows.length > 0) {
     throw httpError(409, 'A user with that username or email already exists');
@@ -594,12 +592,18 @@ app.post('/auth/signup', asyncHandler(async (req, res) => {
     `INSERT INTO users (username, password_hash, display_name, email)
      VALUES ($1, $2, $3, $4)
      RETURNING id, username, display_name, email, created_at`,
-    [username.trim(), hash, displayName || null, email]
+    [username.trim(), hash, displayName || null, normalizedEmail]
   );
   const user = result.rows[0];
   await ensureDefaultRole(pool, user);
-  const publicUser = toPublicUser({ ...user, roles: await getUserRoles(pool, user.id) });
-  const token = signToken({ id: user.id, username: user.username, email: user.email });
+  return toPublicUser({ ...user, roles: await getUserRoles(pool, user.id) });
+};
+
+// Auth
+app.post('/auth/signup', asyncHandler(async (req, res) => {
+  const { username, password, displayName } = req.body;
+  const publicUser = await createUserAccount({ username, password, displayName, email: req.body.email });
+  const token = signToken({ id: publicUser.id, username: publicUser.username, email: publicUser.email });
   res.json({ token, user: publicUser });
 }));
 
@@ -706,6 +710,24 @@ app.get('/admin/users', requireAdmin, asyncHandler(async (req, res) => {
     [search, ADMIN_ROLE, EDITOR_ROLE]
   );
   res.json(result.rows.map(toPublicUser));
+}));
+
+app.post('/admin/users', requireAdmin, asyncHandler(async (req, res) => {
+  const publicUser = await createUserAccount({
+    username: req.body.username,
+    password: req.body.password,
+    displayName: req.body.displayName,
+    email: req.body.email
+  });
+  await logAudit(pool, {
+    entityType: 'user',
+    entityId: publicUser.id,
+    userId: req.currentUser.id,
+    action: 'USER_CREATED',
+    newValue: { id: publicUser.id, username: publicUser.username, email: publicUser.email },
+    note: `${req.currentUser.username} created user ${publicUser.username}`
+  });
+  res.status(201).json(publicUser);
 }));
 
 app.put('/admin/users/:userId/role', requireAdmin, asyncHandler(async (req, res) => {

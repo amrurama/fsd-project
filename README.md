@@ -13,7 +13,7 @@ Full-stack ProjectPulse for creating shared project workspaces, adding trackers,
 - Consolidated task report with filters and CSV export
 - Notifications for project sharing, task assignment, status changes, and comments
 - Audit logs for projects, templates, trackers, tasks, and comments
-- Admin page for updating user roles; Amrutha is bootstrapped as Admin
+- Admin page for creating users and updating roles; Amrutha is bootstrapped as Admin
 - Responsive React UI for dashboard, projects, trackers, templates, reports, and audit logs
 
 ## Database Setup
