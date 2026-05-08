@@ -9,6 +9,15 @@ CREATE TABLE IF NOT EXISTS users (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS user_roles (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    role VARCHAR(50) NOT NULL CHECK (role IN ('ADMIN', 'EDITOR', 'READONLY')),
+    granted_by UUID REFERENCES users(id) ON DELETE SET NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id, role)
+);
+
 CREATE TABLE IF NOT EXISTS templates (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     owner_id UUID REFERENCES users(id) ON DELETE CASCADE,
@@ -107,6 +116,8 @@ CREATE TABLE IF NOT EXISTS notifications (
 );
 
 CREATE INDEX IF NOT EXISTS idx_users_lower_email ON users (lower(email));
+CREATE INDEX IF NOT EXISTS idx_user_roles_user ON user_roles (user_id);
+CREATE INDEX IF NOT EXISTS idx_user_roles_role ON user_roles (role);
 CREATE INDEX IF NOT EXISTS idx_project_members_user ON project_members (user_id);
 CREATE INDEX IF NOT EXISTS idx_project_members_lower_email ON project_members (lower(member_email));
 CREATE INDEX IF NOT EXISTS idx_trackers_project ON trackers (project_id);

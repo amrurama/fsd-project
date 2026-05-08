@@ -9,6 +9,11 @@ app.use(cors());
 app.use(express.json());
 
 const VALID_STATUSES = ['TODO', 'IN_PROGRESS', 'BLOCKED', 'DONE'];
+const ADMIN_ROLE = 'ADMIN';
+const EDITOR_ROLE = 'EDITOR';
+const READONLY_ROLE = 'READONLY';
+const VALID_ROLES = [ADMIN_ROLE, EDITOR_ROLE, READONLY_ROLE];
+const ROLE_PRIORITY = [ADMIN_ROLE, EDITOR_ROLE, READONLY_ROLE];
 
 const asyncHandler = (handler) => (req, res, next) => {
   Promise.resolve(handler(req, res, next)).catch(next);
@@ -39,26 +44,136 @@ const normalizeStatus = (status) => {
   return normalized;
 };
 
+const normalizeRole = (role) => {
+  const normalized = String(role || '').trim().toUpperCase();
+  if (!VALID_ROLES.includes(normalized)) {
+    throw httpError(400, `Role must be one of: ${VALID_ROLES.join(', ')}`);
+  }
+  return normalized;
+};
+
+const getPrimaryRole = (roles = []) => {
+  const normalizedRoles = Array.isArray(roles) ? roles.map((item) => String(item).toUpperCase()) : [];
+  return ROLE_PRIORITY.find((role) => normalizedRoles.includes(role)) || READONLY_ROLE;
+};
+
+const normalizeRoles = (roles) => [getPrimaryRole(Array.isArray(roles) ? roles.filter(Boolean) : [])];
+
+const isAdminUser = (user) => getPrimaryRole(user?.roles) === ADMIN_ROLE;
+
+const canWriteUser = (user) => [ADMIN_ROLE, EDITOR_ROLE].includes(getPrimaryRole(user?.roles));
+
 const toPublicUser = (user) => user && ({
   id: user.id || user.user_id,
   username: user.username,
   display_name: user.display_name,
-  email: user.email
+  email: user.email,
+  created_at: user.created_at,
+  roles: normalizeRoles(user.roles)
 });
+
+const getStoredUserRoles = async (client, userId) => {
+  const result = await client.query(
+    'SELECT role FROM user_roles WHERE user_id = $1 AND role = ANY($2::text[]) ORDER BY role',
+    [userId, VALID_ROLES]
+  );
+  return result.rows.map((row) => row.role);
+};
+
+const getUserRoles = async (client, userId) => normalizeRoles(await getStoredUserRoles(client, userId));
+
+const isBootstrapAdminUser = (user) => {
+  const username = String(user?.username || '').trim().toLowerCase();
+  const displayName = String(user?.display_name || user?.displayName || '').trim().toLowerCase();
+  const email = normalizeEmail(user?.email);
+  return username === 'amrutha' || displayName === 'amrutha' || Boolean(email && email.startsWith('amrutha@'));
+};
+
+const grantUserRole = async (client, userId, role, grantedBy = null) => {
+  const normalizedRole = normalizeRole(role);
+  const result = await client.query(
+    `INSERT INTO user_roles (user_id, role, granted_by)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (user_id, role) DO NOTHING
+     RETURNING *`,
+    [userId, normalizedRole, grantedBy]
+  );
+  return result.rows[0] || null;
+};
+
+const setUserPrimaryRole = async (client, userId, role, grantedBy = null) => {
+  const normalizedRole = normalizeRole(role);
+  await client.query(
+    'DELETE FROM user_roles WHERE user_id = $1 AND role = ANY($2::text[])',
+    [userId, VALID_ROLES]
+  );
+  return grantUserRole(client, userId, normalizedRole, grantedBy);
+};
+
+const ensureDefaultRole = async (client, user) => {
+  if (isBootstrapAdminUser(user)) {
+    return setUserPrimaryRole(client, user.id, ADMIN_ROLE, null);
+  }
+  const storedRoles = await getStoredUserRoles(client, user.id);
+  if (storedRoles.length === 0) {
+    return grantUserRole(client, user.id, READONLY_ROLE, null);
+  }
+  return null;
+};
+
+const getUserWithRoles = async (client, userId) => {
+  const result = await client.query(
+    `SELECT u.id,
+            u.username,
+            u.display_name,
+            u.email,
+            u.created_at,
+            COALESCE(array_remove(array_agg(ur.role ORDER BY ur.role), NULL), '{}') AS roles
+     FROM users u
+     LEFT JOIN user_roles ur ON ur.user_id = u.id
+     WHERE u.id = $1
+     GROUP BY u.id`,
+    [userId]
+  );
+  return result.rows[0] || null;
+};
 
 const loadCurrentUser = asyncHandler(async (req, res, next) => {
   const result = await pool.query(
-    'SELECT id, username, display_name, email FROM users WHERE id = $1',
+    'SELECT id, username, display_name, email, created_at FROM users WHERE id = $1',
     [req.user.id]
   );
   if (result.rows.length === 0) {
     throw httpError(401, 'User no longer exists');
   }
-  req.currentUser = result.rows[0];
+  const user = result.rows[0];
+  req.currentUser = { ...user, roles: await getUserRoles(pool, user.id) };
   next();
 });
 
 const requireAuth = [authMiddleware, loadCurrentUser];
+
+const requireAdmin = [
+  authMiddleware,
+  loadCurrentUser,
+  (req, res, next) => {
+    if (!isAdminUser(req.currentUser)) {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
+    return next();
+  }
+];
+
+const requireEditor = [
+  authMiddleware,
+  loadCurrentUser,
+  (req, res, next) => {
+    if (!canWriteUser(req.currentUser)) {
+      return res.status(403).json({ error: 'Editor or admin access required' });
+    }
+    return next();
+  }
+];
 
 const logAudit = async (client, { entityType, entityId, userId, action, previousValue = null, newValue = null, note = null }) => {
   if (!entityType || !entityId || !action) {
@@ -189,6 +304,7 @@ const getProjectOrThrow = async (client, projectId, user, options = {}) => {
   const project = result.rows[0];
   const userEmail = normalizeEmail(user.email);
   const isOwner = project.owner_id === user.id;
+  const userIsAdmin = isAdminUser(user);
   const membership = await client.query(
     `SELECT 1
      FROM project_members pm
@@ -197,9 +313,9 @@ const getProjectOrThrow = async (client, projectId, user, options = {}) => {
      LIMIT 1`,
     [projectId, user.id, userEmail]
   );
-  const hasAccess = isOwner || membership.rows.length > 0;
+  const hasAccess = userIsAdmin || isOwner || membership.rows.length > 0;
 
-  if (options.ownerOnly && !isOwner) {
+  if (options.ownerOnly && !isOwner && !userIsAdmin) {
     throw httpError(403, 'Only the project owner can perform this action');
   }
   if (!hasAccess) {
@@ -385,6 +501,71 @@ const ensureAuditEntityAccess = async (client, entityType, entityId, user) => {
   }
 };
 
+const ensureRoleSchema = async () => {
+  await pool.query('CREATE EXTENSION IF NOT EXISTS "uuid-ossp"');
+  await pool.query(
+    `CREATE TABLE IF NOT EXISTS user_roles (
+      id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      role VARCHAR(50) NOT NULL,
+      granted_by UUID REFERENCES users(id) ON DELETE SET NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(user_id, role)
+    )`
+  );
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_user_roles_user ON user_roles (user_id)');
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_user_roles_role ON user_roles (role)');
+  await pool.query(
+    `DELETE FROM user_roles
+     WHERE role = ANY($1::text[])
+       AND user_id IN (
+         SELECT id
+         FROM users
+         WHERE lower(username) = 'amrutha'
+            OR lower(display_name) = 'amrutha'
+            OR lower(email) LIKE 'amrutha@%'
+       )`,
+    [VALID_ROLES]
+  );
+  await pool.query(
+    `INSERT INTO user_roles (user_id, role)
+     SELECT id, $1
+     FROM users
+     WHERE lower(username) = 'amrutha'
+        OR lower(display_name) = 'amrutha'
+        OR lower(email) LIKE 'amrutha@%'
+     ON CONFLICT (user_id, role) DO NOTHING`,
+    [ADMIN_ROLE]
+  );
+  await pool.query(
+    `INSERT INTO user_roles (user_id, role)
+     SELECT u.id, $1
+     FROM users u
+     WHERE NOT EXISTS (
+       SELECT 1
+       FROM user_roles ur
+       WHERE ur.user_id = u.id
+         AND ur.role = ANY($2::text[])
+     )
+     ON CONFLICT (user_id, role) DO NOTHING`,
+    [READONLY_ROLE, VALID_ROLES]
+  );
+  await pool.query(
+    `DELETE FROM user_roles lower_role
+     WHERE lower_role.role = ANY($1::text[])
+       AND EXISTS (
+         SELECT 1
+         FROM user_roles higher_role
+         WHERE higher_role.user_id = lower_role.user_id
+           AND (
+             (higher_role.role = $2 AND lower_role.role <> $2)
+             OR (higher_role.role = $3 AND lower_role.role = $4)
+           )
+       )`,
+    [VALID_ROLES, ADMIN_ROLE, EDITOR_ROLE, READONLY_ROLE]
+  );
+};
+
 // Auth
 app.post('/auth/signup', asyncHandler(async (req, res) => {
   const { username, password, displayName } = req.body;
@@ -412,12 +593,14 @@ app.post('/auth/signup', asyncHandler(async (req, res) => {
   const result = await pool.query(
     `INSERT INTO users (username, password_hash, display_name, email)
      VALUES ($1, $2, $3, $4)
-     RETURNING id, username, display_name, email`,
+     RETURNING id, username, display_name, email, created_at`,
     [username.trim(), hash, displayName || null, email]
   );
   const user = result.rows[0];
+  await ensureDefaultRole(pool, user);
+  const publicUser = toPublicUser({ ...user, roles: await getUserRoles(pool, user.id) });
   const token = signToken({ id: user.id, username: user.username, email: user.email });
-  res.json({ token, user });
+  res.json({ token, user: publicUser });
 }));
 
 app.post('/auth/login', asyncHandler(async (req, res) => {
@@ -437,7 +620,8 @@ app.post('/auth/login', asyncHandler(async (req, res) => {
   if (!match) {
     throw httpError(401, 'Invalid credentials');
   }
-  const publicUser = toPublicUser(user);
+  await ensureDefaultRole(pool, user);
+  const publicUser = toPublicUser({ ...user, roles: await getUserRoles(pool, user.id) });
   const token = signToken({ id: user.id, username: user.username, email: user.email });
   res.json({ token, user: publicUser });
 }));
@@ -460,6 +644,96 @@ app.get('/users', requireAuth, asyncHandler(async (req, res) => {
     [search]
   );
   res.json(result.rows.map(toPublicUser));
+}));
+
+const updateUserPrimaryRole = async (client, { targetUserId, role, actor }) => {
+  const nextRole = normalizeRole(role);
+  const target = await getUserWithRoles(client, targetUserId);
+  if (!target) {
+    throw httpError(404, 'User not found');
+  }
+
+  const previousRole = getPrimaryRole(target.roles);
+  if (targetUserId === actor.id && previousRole === ADMIN_ROLE && nextRole !== ADMIN_ROLE) {
+    throw httpError(400, 'You cannot remove your own admin access');
+  }
+
+  if (previousRole === ADMIN_ROLE && nextRole !== ADMIN_ROLE) {
+    const count = await client.query(
+      'SELECT COUNT(*)::int AS count FROM user_roles WHERE role = $1',
+      [ADMIN_ROLE]
+    );
+    if (count.rows[0].count <= 1) {
+      throw httpError(400, 'At least one admin is required');
+    }
+  }
+
+  if (previousRole !== nextRole) {
+    await setUserPrimaryRole(client, targetUserId, nextRole, actor.id);
+    await logAudit(client, {
+      entityType: 'user',
+      entityId: targetUserId,
+      userId: actor.id,
+      action: 'ROLE_UPDATED',
+      previousValue: { role: previousRole },
+      newValue: { role: nextRole },
+      note: `Role changed from ${previousRole} to ${nextRole}`
+    });
+    await notifyUser(client, targetUserId, `${actor.username} changed your role to ${nextRole}.`);
+  }
+
+  return getUserWithRoles(client, targetUserId);
+};
+
+// Admin
+app.get('/admin/users', requireAdmin, asyncHandler(async (req, res) => {
+  const search = req.query.search ? `%${String(req.query.search).trim()}%` : null;
+  const result = await pool.query(
+    `SELECT u.id,
+            u.username,
+            u.display_name,
+            u.email,
+            u.created_at,
+            COALESCE(array_remove(array_agg(ur.role ORDER BY ur.role), NULL), '{}') AS roles
+     FROM users u
+     LEFT JOIN user_roles ur ON ur.user_id = u.id
+     WHERE $1::text IS NULL
+        OR u.username ILIKE $1
+        OR u.display_name ILIKE $1
+        OR u.email ILIKE $1
+     GROUP BY u.id
+     ORDER BY bool_or(ur.role = $2) DESC, bool_or(ur.role = $3) DESC, u.created_at DESC`,
+    [search, ADMIN_ROLE, EDITOR_ROLE]
+  );
+  res.json(result.rows.map(toPublicUser));
+}));
+
+app.put('/admin/users/:userId/role', requireAdmin, asyncHandler(async (req, res) => {
+  const updated = await updateUserPrimaryRole(pool, {
+    targetUserId: req.params.userId,
+    role: req.body.role,
+    actor: req.currentUser
+  });
+  res.json(toPublicUser(updated));
+}));
+
+app.post('/admin/users/:userId/roles', requireAdmin, asyncHandler(async (req, res) => {
+  const updated = await updateUserPrimaryRole(pool, {
+    targetUserId: req.params.userId,
+    role: req.body.role || ADMIN_ROLE,
+    actor: req.currentUser
+  });
+  res.json(toPublicUser(updated));
+}));
+
+app.delete('/admin/users/:userId/roles/:role', requireAdmin, asyncHandler(async (req, res) => {
+  normalizeRole(req.params.role);
+  const updated = await updateUserPrimaryRole(pool, {
+    targetUserId: req.params.userId,
+    role: READONLY_ROLE,
+    actor: req.currentUser
+  });
+  res.json(toPublicUser(updated));
 }));
 
 // Templates
@@ -504,7 +778,7 @@ app.get('/templates/:templateId/versions', requireAuth, asyncHandler(async (req,
   res.json(result.rows);
 }));
 
-app.post('/templates', requireAuth, asyncHandler(async (req, res) => {
+app.post('/templates', requireEditor, asyncHandler(async (req, res) => {
   const { name, description } = req.body;
   const visibility = req.body.visibility === 'PUBLIC' ? 'PUBLIC' : 'PRIVATE';
   const schemaJson = req.body.schemaJson || {};
@@ -544,7 +818,7 @@ app.post('/templates', requireAuth, asyncHandler(async (req, res) => {
   }
 }));
 
-app.post('/templates/:templateId/versions', requireAuth, asyncHandler(async (req, res) => {
+app.post('/templates/:templateId/versions', requireEditor, asyncHandler(async (req, res) => {
   const { templateId } = req.params;
   const template = await pool.query(
     'SELECT * FROM templates WHERE id = $1 AND owner_id = $2',
@@ -584,7 +858,8 @@ app.get('/projects', requireAuth, asyncHandler(async (req, res) => {
             owner.email AS owner_email
      FROM projects p
      JOIN users owner ON owner.id = p.owner_id
-     WHERE p.owner_id = $1
+     WHERE $3::boolean
+        OR p.owner_id = $1
         OR EXISTS (
           SELECT 1
           FROM project_members pm
@@ -592,7 +867,7 @@ app.get('/projects', requireAuth, asyncHandler(async (req, res) => {
             AND (pm.user_id = $1 OR ($2::text IS NOT NULL AND lower(pm.member_email) = lower($2)))
         )
      ORDER BY p.created_at DESC`,
-    [req.currentUser.id, userEmail]
+    [req.currentUser.id, userEmail, isAdminUser(req.currentUser)]
   );
   const projects = await Promise.all(result.rows.map((project) => enrichProject(pool, project)));
   res.json(projects);
@@ -607,10 +882,11 @@ app.get('/member-of-projects', requireAuth, asyncHandler(async (req, res) => {
      FROM projects p
      JOIN users owner ON owner.id = p.owner_id
      JOIN project_members pm ON pm.project_id = p.id
-     WHERE p.owner_id <> $1
+     WHERE NOT $3::boolean
+       AND p.owner_id <> $1
        AND (pm.user_id = $1 OR ($2::text IS NOT NULL AND lower(pm.member_email) = lower($2)))
      ORDER BY p.created_at DESC`,
-    [req.currentUser.id, normalizeEmail(req.currentUser.email)]
+    [req.currentUser.id, normalizeEmail(req.currentUser.email), isAdminUser(req.currentUser)]
   );
   const enriched = await Promise.all(projects.rows.map((project) => enrichProject(pool, project)));
   res.json(enriched);
@@ -626,7 +902,7 @@ app.get('/projects/:projectId/members', requireAuth, asyncHandler(async (req, re
   res.json(await getAssignableUsers(pool, req.params.projectId));
 }));
 
-app.post('/projects', requireAuth, asyncHandler(async (req, res) => {
+app.post('/projects', requireEditor, asyncHandler(async (req, res) => {
   const { name, description, templateId } = req.body;
   if (!name || !name.trim()) {
     throw httpError(400, 'Project name is required');
@@ -663,7 +939,7 @@ app.post('/projects', requireAuth, asyncHandler(async (req, res) => {
   }
 }));
 
-app.put('/projects/:projectId', requireAuth, asyncHandler(async (req, res) => {
+app.put('/projects/:projectId', requireEditor, asyncHandler(async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -709,7 +985,7 @@ app.put('/projects/:projectId', requireAuth, asyncHandler(async (req, res) => {
   }
 }));
 
-app.delete('/projects/:projectId', requireAuth, asyncHandler(async (req, res) => {
+app.delete('/projects/:projectId', requireEditor, asyncHandler(async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -749,7 +1025,7 @@ app.get('/projects/:projectId/trackers', requireAuth, asyncHandler(async (req, r
   res.json(result.rows);
 }));
 
-app.post('/trackers', requireAuth, asyncHandler(async (req, res) => {
+app.post('/trackers', requireEditor, asyncHandler(async (req, res) => {
   const { projectId, templateVersionId, name } = req.body;
   if (!projectId || !name || !name.trim()) {
     throw httpError(400, 'projectId and tracker name are required');
@@ -772,7 +1048,7 @@ app.post('/trackers', requireAuth, asyncHandler(async (req, res) => {
   res.json(result.rows[0]);
 }));
 
-app.put('/trackers/:trackerId', requireAuth, asyncHandler(async (req, res) => {
+app.put('/trackers/:trackerId', requireEditor, asyncHandler(async (req, res) => {
   const { tracker } = await getTrackerContext(pool, req.params.trackerId, req.currentUser);
   if (!req.body.name || !req.body.name.trim()) {
     throw httpError(400, 'Tracker name is required');
@@ -792,9 +1068,9 @@ app.put('/trackers/:trackerId', requireAuth, asyncHandler(async (req, res) => {
   res.json(result.rows[0]);
 }));
 
-app.delete('/trackers/:trackerId', requireAuth, asyncHandler(async (req, res) => {
+app.delete('/trackers/:trackerId', requireEditor, asyncHandler(async (req, res) => {
   const { tracker, project } = await getTrackerContext(pool, req.params.trackerId, req.currentUser);
-  if (project.owner_id !== req.currentUser.id && tracker.created_by !== req.currentUser.id) {
+  if (!isAdminUser(req.currentUser) && project.owner_id !== req.currentUser.id && tracker.created_by !== req.currentUser.id) {
     throw httpError(403, 'Only the project owner or tracker creator can delete this tracker');
   }
   await logAudit(pool, {
@@ -815,9 +1091,10 @@ app.get('/trackers/:trackerId/tasks', requireAuth, asyncHandler(async (req, res)
 }));
 
 app.get('/tasks/report', requireAuth, asyncHandler(async (req, res) => {
-  const params = [req.currentUser.id, normalizeEmail(req.currentUser.email)];
+  const params = [req.currentUser.id, normalizeEmail(req.currentUser.email), isAdminUser(req.currentUser)];
   const conditions = [
-    `(p.owner_id = $1
+    `($3::boolean
+      OR p.owner_id = $1
       OR tt.assigned_to = $1
       OR EXISTS (
         SELECT 1
@@ -826,7 +1103,7 @@ app.get('/tasks/report', requireAuth, asyncHandler(async (req, res) => {
           AND (pm.user_id = $1 OR ($2::text IS NOT NULL AND lower(pm.member_email) = lower($2)))
       ))`
   ];
-  let nextIndex = 3;
+  let nextIndex = 4;
 
   if (req.query.status) {
     conditions.push(`tt.status = $${nextIndex}`);
@@ -859,7 +1136,7 @@ app.get('/tasks/report', requireAuth, asyncHandler(async (req, res) => {
   res.json(tasks);
 }));
 
-app.post('/tasks', requireAuth, asyncHandler(async (req, res) => {
+app.post('/tasks', requireEditor, asyncHandler(async (req, res) => {
   const { trackerId, title, description } = req.body;
   if (!trackerId || !title || !title.trim()) {
     throw httpError(400, 'trackerId and task title are required');
@@ -912,7 +1189,7 @@ app.post('/tasks', requireAuth, asyncHandler(async (req, res) => {
   }
 }));
 
-app.put('/tasks/:taskId', requireAuth, asyncHandler(async (req, res) => {
+app.put('/tasks/:taskId', requireEditor, asyncHandler(async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -1007,9 +1284,9 @@ app.put('/tasks/:taskId', requireAuth, asyncHandler(async (req, res) => {
   }
 }));
 
-app.delete('/tasks/:taskId', requireAuth, asyncHandler(async (req, res) => {
+app.delete('/tasks/:taskId', requireEditor, asyncHandler(async (req, res) => {
   const { task, project } = await getTaskContext(pool, req.params.taskId, req.currentUser);
-  if (project.owner_id !== req.currentUser.id && task.created_by !== req.currentUser.id) {
+  if (!isAdminUser(req.currentUser) && project.owner_id !== req.currentUser.id && task.created_by !== req.currentUser.id) {
     throw httpError(403, 'Only the project owner or task creator can delete this task');
   }
   await logAudit(pool, {
@@ -1039,7 +1316,7 @@ app.get('/tasks/:taskId/comments', requireAuth, asyncHandler(async (req, res) =>
   res.json(result.rows);
 }));
 
-app.post('/tasks/:taskId/comments', requireAuth, asyncHandler(async (req, res) => {
+app.post('/tasks/:taskId/comments', requireEditor, asyncHandler(async (req, res) => {
   const comment = req.body.comment ? String(req.body.comment).trim() : '';
   if (!comment) {
     throw httpError(400, 'Comment is required');
@@ -1085,7 +1362,7 @@ app.get('/notifications', requireAuth, asyncHandler(async (req, res) => {
   res.json(result.rows);
 }));
 
-app.post('/notifications', requireAuth, asyncHandler(async (req, res) => {
+app.post('/notifications', requireEditor, asyncHandler(async (req, res) => {
   const { userId, message } = req.body;
   if (!userId || !message) {
     throw httpError(400, 'userId and message are required');
@@ -1146,7 +1423,7 @@ app.get('/audit', requireAuth, asyncHandler(async (req, res) => {
   res.json(result.rows);
 }));
 
-app.post('/audit', requireAuth, asyncHandler(async (req, res) => {
+app.post('/audit', requireEditor, asyncHandler(async (req, res) => {
   const { entityType, entityId, action, previousValue, newValue, note } = req.body;
   if (!entityType || !entityId || !action) {
     throw httpError(400, 'entityType, entityId and action are required');
@@ -1182,4 +1459,11 @@ app.use((err, req, res, next) => {
 });
 
 const PORT = process.env.PORT || 4000;
-app.listen(PORT, () => console.log(`Unified server running on ${PORT}`));
+ensureRoleSchema()
+  .then(() => {
+    app.listen(PORT, () => console.log(`Unified server running on ${PORT}`));
+  })
+  .catch((error) => {
+    console.error('Failed to initialize admin role schema', error);
+    process.exit(1);
+  });

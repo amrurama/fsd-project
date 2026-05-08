@@ -5,6 +5,7 @@ Full-stack ProjectPulse for creating shared project workspaces, adding trackers,
 ## What Is Included
 
 - User signup/login with Basic auth
+- Role based access backed by a `user_roles` table: Admin, Editor, and Readonly User
 - Project creation with email-based sharing
 - Project member lookup and assignable member lists
 - Tracker creation per project, with optional template versions
@@ -12,6 +13,7 @@ Full-stack ProjectPulse for creating shared project workspaces, adding trackers,
 - Consolidated task report with filters and CSV export
 - Notifications for project sharing, task assignment, status changes, and comments
 - Audit logs for projects, templates, trackers, tasks, and comments
+- Admin page for updating user roles; Amrutha is bootstrapped as Admin
 - Responsive React UI for dashboard, projects, trackers, templates, reports, and audit logs
 
 ## Database Setup
@@ -27,6 +29,8 @@ For an existing database, apply migrations in order:
 ```bash
 psql -U postgres -d smart_tasks -f src/backend/db/migrations/001_add_member_email.sql
 psql -U postgres -d smart_tasks -f src/backend/db/migrations/002_add_access_indexes.sql
+psql -U postgres -d smart_tasks -f src/backend/db/migrations/003_add_user_roles.sql
+psql -U postgres -d smart_tasks -f src/backend/db/migrations/004_expand_user_roles.sql
 ```
 
 The backend reads these environment variables when present: `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`, and `JWT_SECRET`.

@@ -16,6 +16,13 @@ Auth and users:
 - `GET /users/me`
 - `GET /users?search=alice`
 
+Admin:
+
+- `GET /admin/users`
+- `PUT /admin/users/:userId/role`
+- `POST /admin/users/:userId/roles`
+- `DELETE /admin/users/:userId/roles/:role`
+
 Templates:
 
 - `GET /templates`
@@ -67,4 +74,6 @@ Then run:
 
 ```bash
 psql -U postgres -d smart_tasks -f db/migrations/002_add_access_indexes.sql
+psql -U postgres -d smart_tasks -f db/migrations/003_add_user_roles.sql
+psql -U postgres -d smart_tasks -f db/migrations/004_expand_user_roles.sql
 ```
